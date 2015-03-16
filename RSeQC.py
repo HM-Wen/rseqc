@@ -29,33 +29,34 @@ def run_shell( cmd ):
     print "Running: " + cmd
     subprocess.check_call(cmd, shell=True, env=new_env)
 
-def map_contaminant(Contig, Reads):
+def map_contaminant(contaminant, original_reads):
     # get ID of our mapper
     try:
-        bwa = dxpy.DXApp(dxpy.find_apps(name="bwa").next()['id'])
+        bwa = dxpy.DXApp(dxpy.find_apps(name="bwa_mem_fastq_read_mapper").next()['id'])
     except StopIteration:
-        raise dxpy.AppError("Unable to find app 'bwa'.  Please install it to enable contaminant mapping")
-
-    # TODO: find optimal chunk size so we don't launch too many bwa jobs
-    map_job = bwa.run({"reads":Reads, "reference": Contig, "discard_unmapped_rows":True, "chunk_size":10000000})
-
-    total_reads = 0
-    for r in Reads:
-        desc = dxpy.DXGTable(r).describe()
-        current_reads = desc['length']
-        if 'sequence2' in desc['columns']:
-            current_reads *= 2
-        total_reads += current_reads
-
+        raise dxpy.AppError("Unable to find app 'bwa_mem_fastq_read_mapper'.  Please install it to enable contaminant mapping")
+    
+    reads1 = original_reads[0]
+    reads2 = None
+    if len(original_reads) > 1: 
+        reads2 = original_reads[1]
+    
+    map_job = bwa.run({"reads_fastqgz":reads1, "reads2_fastqgz": reads2, "genomeindex_targz": contaminant})
+    
     # launch a job to wait for the mapping and will calculate what % has mapped
-    calc_job = dxpy.new_dxjob({"num_reads":total_reads, "mappings":{"job":map_job.get_id(), "field":"mappings"}}, "calc_contam")
-
+    calc_job = dxpy.new_dxjob({"bam": {"job": map_job.get_id(), "field": "sorted_bam"}, "bai":{"job":map_job.get_id(), "field":"sorted_bai"}}, "calc_contam")
+    
     return calc_job.get_id()
 
 @dxpy.entry_point("calc_contam")
-def calc_contam(num_reads, mappings):
-    percent_mapped = float(dxpy.DXGTable(mappings).describe()['length'])/float(num_reads)
-
+def calc_contam(bam, bai):
+    bam = dxpy.download_dxfile(bam, "mapped_reads.bam")
+    bai = dxpy.download_dxfile(bai, "mapped_reads.bam.bai") 
+    
+    all_reads = subprocess.check_output("samtools view -c mapped_reads.bam", shell=True) 
+    mapped_reads = subprocess.check_output("samtools view -c -F 0x4 mapped_reads.bam", shell=True)
+ 
+    percent_mapped = float(mapped_reads)/float(all_reads)
     return {"percent_mapped":percent_mapped}
 
 @dxpy.entry_point("geneBody_coverage")
@@ -113,14 +114,15 @@ def gbc_agg(sub_reports):
             fh.readline()
 
             for bucket in range(100):
-                line = fh.readline()
+                line = fh.readline() 
                 count = float(line.split("\t")[1])
                 cover[bucket] += count
                 total_reads += count
 
     # normalize by total reads for %
-    for i in range(len(cover)):
-        cover[i] /= total_reads
+    if total_reads > 0:
+        for i in range(len(cover)):
+            cover[i] /= total_reads
     
     return {"cover":cover}
 
@@ -129,9 +131,13 @@ def inner_distance(BAM_file, BED_file):
     dxpy.download_dxfile(BED_file, "genes.bed")
     dxpy.download_dxfile(BAM_file, "mappings.bam")
 
-    run_shell( " ".join(["inner_distance.py", "-i mappings.bam", "-r genes.bed", "-o inner", "-l -303", "-u 5002"]))
-    
-    results_id = dxpy.upload_local_file("inner.inner_distance_freq.txt", wait_on_close=True).get_id()
+    reads_paired = subprocess.check_output("samtools view -c -f 0x1 mappings.bam", shell=True)
+    results_id = None
+
+    if int(reads_paired) > 0: 
+        run_shell( " ".join(["inner_distance.py", "-i mappings.bam", "-r genes.bed", "-o inner", "-l -303", "-u 5002"]))
+        results_id = dxpy.upload_local_file("inner.inner_distance_freq.txt", wait_on_close=True).get_id()
+
     return {"results":results_id}
 
 
@@ -357,7 +363,7 @@ def generate_report(geneBody, inner_dist, junc_ann, read_dist, read_dup, mapping
     # add link to mappings
     report_details['original_mappings'] = mappings
 
-    report_name = dxpy.DXGTable(mappings).describe()['name'] + " RSeQC report"
+    report_name = dxpy.DXFile(mappings).describe()['name'] + " RSeQC report"
 
     # create report
     report = dxpy.new_dxrecord(name=report_name, details=report_details, types=["Report", "RSeQC"])
@@ -369,10 +375,9 @@ def generate_report(geneBody, inner_dist, junc_ann, read_dist, read_dup, mapping
 def main(**job_inputs):
     output = {}
     reportInput = {}
-    
-    run_shell("dx-spans-to-bed --output genes.bed " + job_inputs["gene_model"]["$dnanexus_link"])
-    bed_id = dxpy.upload_local_file("genes.bed").get_id()
-    mappings_id = job_inputs["mappings"]["$dnanexus_link"]
+
+    bed_id = job_inputs["gene_model"]["$dnanexus_link"]
+    bam_id = job_inputs["mappings"]["$dnanexus_link"]
 
     # get contaminant mapping started if we're doing it:
     if "contaminants" in job_inputs:
@@ -382,11 +387,10 @@ def main(**job_inputs):
         name_input = []
         contam_input = []
 
-        #spawn mappings job for each ContigSet
+        #spawn mappings job for each contaminant
         for contaminant in job_inputs['contaminants']:
-            calc_job = map_contaminant(Reads=job_inputs['original_reads'], Contig=contaminant)
-
-            name_input.append(dxpy.DXRecord(contaminant).describe()['name'])
+            calc_job = map_contaminant(contaminant, job_inputs['original_reads'])
+            name_input.append(dxpy.DXFile(contaminant).describe()['name'])
             contam_input.append({"job":calc_job, "field":"percent_mapped"})
     
         reportInput['contam'] = contam_input
@@ -395,33 +399,20 @@ def main(**job_inputs):
         reportInput['contam'] = None
         reportInput['names'] = None
 
-    # output mappings as SAM for analysis modules
-    run_shell(" ".join(["dx-mappings-to-sam", "--discard_unmapped", "--output mappings.sam", mappings_id]))
-    run_shell(" ".join(["samtools", "view", "-S", "-b", "mappings.sam", ">", "mappings.bam"]))
-    bam_id = dxpy.upload_local_file("mappings.bam", wait_on_close=True).get_id()
+    job1 = dxpy.new_dxjob( {'BED_file':bed_id, "BAM_file":bam_id}, "geneBody_coverage" )
 
-    job1 = dxpy.new_dxjob( {'BED_file':bed_id, "BAM_file":dxpy.dxlink(bam_id)}, "geneBody_coverage" )
+    job2 = dxpy.new_dxjob( {'BED_file':bed_id, "BAM_file":bam_id}, "inner_distance" )
+    
+    job3 = dxpy.new_dxjob( {'BED_file':bed_id, "BAM_file":bam_id}, "junction_annotation" )
 
-    # if paired then do inner distance calculation
-    if "chr2" in dxpy.DXGTable(mappings_id).get_col_names():
-        job2 = dxpy.new_dxjob( {'BED_file':bed_id, "BAM_file":dxpy.dxlink(bam_id)}, "inner_distance" )
-    else:
-        job2 = None
-
-    job3 = dxpy.new_dxjob( {'BED_file':bed_id, "BAM_file":dxpy.dxlink(bam_id)}, "junction_annotation" )
-
-    job4 = dxpy.new_dxjob( {"BAM_file":dxpy.dxlink(bam_id)}, "read_duplication" )
+    job4 = dxpy.new_dxjob( {"BAM_file":bam_id}, "read_duplication" )
 
     # implement this one when we can request a large RAM instance - requires 19GB for human genome
-    job5 = dxpy.new_dxjob( {'BED_file':bed_id, "BAM_file":dxpy.dxlink(bam_id)}, "read_distribution")
+    job5 = dxpy.new_dxjob( {'BED_file':bed_id, "BAM_file":bam_id}, "read_distribution")
     #                       {"systemRequirements": {"instanceType":"dx_m2.2xlarge"}} )
 
     reportInput['geneBody'] = {"job":job1.get_id(), "field":"results"}
-    if job2 != None:
-        reportInput['inner_dist'] = {"job":job2.get_id(), "field":"results"}
-    else:
-        reportInput['inner_dist'] = None
-
+    reportInput['inner_dist'] = {"job":job2.get_id(), "field":"results"}
     reportInput['junc_ann'] = {"job":job3.get_id(), "field":"results"}
     reportInput['read_dup'] = {"job":job4.get_id(), "field":"results"}
     reportInput['read_dist'] = {"job":job5.get_id(), "field":"results"}
