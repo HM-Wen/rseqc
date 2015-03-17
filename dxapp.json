@@ -53,7 +53,7 @@
     }
   ],
   "runSpec": {
-    "file": "src/code.py",
+    "file": "RSeQC.py",
     "interpreter": "python2.7",
     "execDepends": [{"name": "python-numpy"}],
     "buildDepends": [{"name": "libncurses5-dev"}],
