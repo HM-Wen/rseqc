@@ -32,9 +32,9 @@ def run_shell( cmd ):
 def map_contaminant(Contig, Reads):
     # get ID of our mapper
     try:
-        bwa = dxpy.DXApp(dxpy.find_apps(name="bwa").next()['id'])
+        bwa = dxpy.DXApp(dxpy.find_apps(name="bwa_mem_fastq_read_mapper").next()['id'])
     except StopIteration:
-        raise dxpy.AppError("Unable to find app 'bwa'.  Please install it to enable contaminant mapping")
+        raise dxpy.AppError("Unable to find app 'bwa_mem_fastq_read_mapper'.  Please install it to enable contaminant mapping")
 
     # TODO: find optimal chunk size so we don't launch too many bwa jobs
     map_job = bwa.run({"reads":Reads, "reference": Contig, "discard_unmapped_rows":True, "chunk_size":10000000})
@@ -369,9 +369,8 @@ def generate_report(geneBody, inner_dist, junc_ann, read_dist, read_dup, mapping
 def main(**job_inputs):
     output = {}
     reportInput = {}
-    
-    run_shell("dx-spans-to-bed --output genes.bed " + job_inputs["gene_model"]["$dnanexus_link"])
-    bed_id = dxpy.upload_local_file("genes.bed").get_id()
+
+    bed_id = job_inputs['gene_model']['$dnanexus_link']
     mappings_id = job_inputs["mappings"]["$dnanexus_link"]
 
     # get contaminant mapping started if we're doing it:
@@ -386,7 +385,7 @@ def main(**job_inputs):
         for contaminant in job_inputs['contaminants']:
             calc_job = map_contaminant(Reads=job_inputs['original_reads'], Contig=contaminant)
 
-            name_input.append(dxpy.DXRecord(contaminant).describe()['name'])
+            name_input.append(dxpy.DXFile(contaminant).describe()['name'])
             contam_input.append({"job":calc_job, "field":"percent_mapped"})
     
         reportInput['contam'] = contam_input
